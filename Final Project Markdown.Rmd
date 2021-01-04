@@ -1,0 +1,288 @@
+---
+title: "Heart Disease Project"
+author: "Tyler O'Connor, Parth Shah, Vincent Pepe"
+date: "12/14/2020"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(tidymodels)
+library(skimr)
+library(MLmetrics)
+library(neuralnet)
+library(keras)
+library(tensorflow)
+library(vip)
+```
+
+```{r, message=FALSE, warning=FALSE}
+install_keras()
+install_tensorflow()
+```
+
+```{r}
+heart_fail_df <- read.csv("heart_failure_data.csv")
+```
+
+```{r}
+test_lm <- glm(DEATH_EVENT ~., data = heart_fail_df)
+summary(test_lm)
+
+heart_2 <- heart_fail_df %>% 
+  mutate(death_event = as.factor(DEATH_EVENT),
+         anaemia = as.factor(anaemia),
+         diabetes = as.factor(diabetes),
+         sex = as.factor(sex),
+         smoking = as.factor(smoking)) %>% 
+  select(-DEATH_EVENT)
+
+skim(heart_2)
+
+set.seed(1234)
+
+heart_3 <- heart_2 %>% 
+  select(death_event, time, serum_creatinine, ejection_fraction, age)
+```
+
+Splitting into test and train
+```{r}
+heart_3 <- heart_2 %>% 
+  select(death_event, time, serum_creatinine, ejection_fraction, age)
+
+heart_split <- initial_split(heart_3)
+heart_train <- training(heart_split)
+heart_test <- testing(heart_split)
+
+```
+
+```{r}
+heart_rec <- recipe(death_event ~., data = heart_train) %>% 
+  step_downsample(death_event) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_numeric()) %>% 
+  step_normalize(all_numeric()) %>% 
+  prep()
+
+heart_rec
+
+```
+
+gives us correctly downsized dataset we want to train the model
+```{r}
+juice(heart_rec) %>% count(death_event)
+```
+
+Create Logistic Regression Model and workflow
+```{r}
+logit_spec_glm <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+logit_fit_glm <- logit_spec_glm %>% 
+  fit(death_event ~.,
+      data = juice(heart_rec))
+
+logit_fit_glm
+
+logit_glm_wf <- workflow() %>% 
+  add_formula(death_event ~.) %>% 
+  add_model(logit_spec_glm)
+```
+
+Create Neural Net Model
+```{r, message=FALSE, warning=FALSE}
+nn_spec <- mlp(epochs = 100, hidden_units = 5, dropout = 0.1) %>% 
+  set_engine("keras", verbose = 0) %>% 
+  # # Also set engine-specific `verbose` argument to prevent logging the results
+  set_mode("classification")
+
+nn_fit <- nn_spec %>% 
+  fit(death_event ~., data = juice(heart_rec))
+
+nn_fit
+```
+
+Create XGBoost Model and Workflow
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(), loss_reduction = tune(),
+  sample_size = tune(), mtry = tune(),
+  learn_rate = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), heart_train),
+  learn_rate(),
+  size = 20
+)
+
+xgb_grid
+
+
+xgb_wf <- workflow() %>% 
+  add_formula(death_event ~.) %>% 
+  add_model(xgb_spec)
+```
+
+Validation Splits
+```{r}
+set.seed(1234)
+validation_splits <- mc_cv(juice(heart_rec), prop = 0.9, strata = death_event)
+```
+
+Exploring Logistic Regression Results
+```{r, warning=FALSE}
+logit_res <- fit_resamples(
+  death_event ~.,
+  logit_spec_glm,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+logit_res %>% 
+  collect_metrics()
+
+logit_res %>% 
+  unnest(.predictions) %>% 
+  roc_curve(death_event, .pred_1) %>% 
+  autoplot()
+```
+
+Finalizing Logistic Regression
+```{r}
+show_best(logit_res, "roc_auc")
+
+
+best_auc <- select_best(logit_res, "roc_auc")
+best_auc
+
+set.seed(1234)
+(final_logit <- finalize_workflow(logit_glm_wf, best_auc))
+
+
+final_logit %>% 
+  fit(data = heart_train) %>% 
+  pull_workflow_fit() %>% 
+  vip(geom = "point")
+
+
+final_res <- last_fit(final_logit, heart_split)
+
+final_res %>% 
+  collect_metrics()
+
+final_res %>% 
+  collect_predictions() %>% 
+  conf_mat(death_event, .pred_class)
+
+final_res %>% 
+  collect_predictions() %>%
+  roc_curve(death_event, .pred_1) %>% 
+  autoplot()
+
+final_res %>% 
+  collect_predictions()
+```
+
+Exploring Neural Network Results
+```{r}
+nn_res <- fit_resamples(
+  death_event ~.,
+  nn_spec,
+  validation_splits,
+  control = control_resamples(save_pred = T)
+)
+
+
+nn_res %>% 
+  collect_metrics()
+
+nn_res %>% 
+  unnest(.predictions) %>% 
+  roc_curve(death_event, .pred_1) %>% 
+  autoplot()
+
+nn_res %>% 
+  unnest(.predictions) %>% 
+  roc_curve(death_event, .pred_0) %>% 
+  autoplot()
+```
+
+Exploring XGBoost Model Results
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(1234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = validation_splits,
+  grid = xgb_grid,
+  control = control_grid(save_pred = T)
+)
+
+xgb_res %>% 
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>% 
+  select(mean, mtry:sample_size) %>% 
+  pivot_longer(mtry:sample_size,
+               names_to = "parameter",
+               values_to = "value") %>% 
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = F) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(title = "Variable Importance")
+
+show_best(xgb_res, "roc_auc")
+
+xgb_res %>% 
+  unnest(.predictions) %>% 
+  roc_curve(death_event, .pred_1) %>% 
+  autoplot()
+```
+
+Finalizing XGBoost Model
+```{r}
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+
+set.seed(1234)
+(final_xgb <- finalize_workflow(xgb_wf, best_auc))
+
+
+final_xgb %>% 
+  fit(data = heart_train) %>% 
+  pull_workflow_fit() %>% 
+  vip(geom = "point")
+
+
+final_res <- last_fit(final_xgb, heart_split)
+
+final_res %>% 
+  collect_metrics()
+
+final_res %>% 
+  collect_predictions() %>% 
+  conf_mat(death_event, .pred_class)
+
+final_res %>% 
+  collect_predictions() %>%
+  roc_curve(death_event, .pred_1) %>% 
+  autoplot()
+
+final_res %>% 
+  collect_predictions()
+```
+
