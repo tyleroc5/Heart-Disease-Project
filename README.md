@@ -1,0 +1,3 @@
+# MSDS_Heart_Disease_Project
+
+In just the United States, there are approximately 550,000 new diagnosed cases of heart failure each year. This ever-growing number is accompanied by an even scarier number of yearly deaths: 287,000. As we are in a global pandemic where the virus mostly affects patients with pre-existing conditions, we thought it would be a great idea to look at some of the main factors that lead to heart failure. The dataset, which we found on kaggle, consists of 299 observations and 11 variables. We plan to use 11 of the variables to try and predict the survival rate of those 300 patients. 
